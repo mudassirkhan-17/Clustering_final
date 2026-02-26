@@ -37,6 +37,7 @@ AGGLO_DIST             = 1.2   # Ward distance threshold for Agglomerative
 CREAM_CONSOLIDATION_SIM = 0.78 # Phase 2A: centroid cosine sim to merge cream clusters
 ASSIGN_THRESHOLD        = 0.70 # Phase 2B: min cosine sim to nearest centroid for assignment
 ORPHAN_MIN_SAMPLES      = 3    # Phase 2B Step 2: PLSCAN min_samples on orphans
+CREAM_MIN_INTRA_SIM     = 0.60 # Post-hoc quality gate: reject cream clusters below this mean intra-sim
 # ══════════════════════════════════════════════════════════════
 
 
@@ -129,30 +130,18 @@ else:
     _emb_cache = {}
     print(f"\n📭 No embedding cache found — will build from scratch.")
 
-# Identify which articles need fresh embeddings
+# Identify which articles are in cache vs new
 df["_cache_key"] = df.apply(_article_key, axis=1)
 _missing_mask    = ~df["_cache_key"].isin(_emb_cache)
-_missing_idx     = df.index[_missing_mask].tolist()
 
 print(f"   Cache hits   : {(~_missing_mask).sum():,}")
-print(f"   Need embed   : {len(_missing_idx):,}")
+print(f"   Skipped (no cache): {_missing_mask.sum():,}  ← new articles dropped, using cache only")
 
-if _missing_idx:
-    print(f"⏳ Embedding {len(_missing_idx):,} new articles...")
-    BATCH = 128
-    for start in range(0, len(_missing_idx), BATCH):
-        batch_idx   = _missing_idx[start : start + BATCH]
-        batch_texts = df.loc[batch_idx, "embed_text"].tolist()
-        batch_embs  = embed_batch(batch_texts)
-        for idx, emb in zip(batch_idx, batch_embs):
-            _emb_cache[df.at[idx, "_cache_key"]] = emb
-        done = min(start + BATCH, len(_missing_idx))
-        if (done // BATCH) % 5 == 0 or done == len(_missing_idx):
-            print(f"   {done}/{len(_missing_idx)} embedded...")
-    # Persist updated cache
-    with open(_cache_path, "wb") as _f:
-        pickle.dump(_emb_cache, _f)
-    print(f"   💾 Cache saved → {_cache_path}")
+# Drop articles not in cache — use cached embeddings only, no API calls
+if _missing_mask.any():
+    df = df[~_missing_mask].reset_index(drop=True)
+    n  = len(df)
+    print(f"   Working with   : {n:,} articles (cache-only mode)")
 
 df["embedding"] = [np.array(_emb_cache[k], dtype=np.float32) for k in df["_cache_key"]]
 df.drop(columns=["_cache_key"], inplace=True)
@@ -330,6 +319,38 @@ for comp in components:
     })
     certified_article_ids |= article_set
     # soft_articles fall through to uncertified → handled by Phase 2
+
+# ── Post-hoc quality gate ─────────────────────────────────
+# Compute mean pairwise intra-sim for each cream cluster.
+# Clusters below CREAM_MIN_INTRA_SIM are rejected: their articles
+# are removed from certified_article_ids and fall into uncertified,
+# where Phase 2B gives them a second chance via nearest-centroid.
+_kept_clusters   = []
+_kept_meta       = []
+_rejected_count  = 0
+_rejected_arts   = 0
+
+for _cs, _cm in zip(cream_clusters, cream_meta):
+    _idxs  = list(_cs)
+    _vecs  = emb_norm[_idxs]
+    _smat  = _vecs @ _vecs.T
+    _upper = _smat[np.triu_indices(len(_idxs), k=1)]
+    _msim  = float(_upper.mean()) if len(_upper) > 0 else 0.0
+
+    if _msim >= CREAM_MIN_INTRA_SIM:
+        _kept_clusters.append(_cs)
+        _kept_meta.append(_cm)
+    else:
+        certified_article_ids -= _cs   # send back to uncertified pool
+        _rejected_count += 1
+        _rejected_arts  += len(_cs)
+
+cream_clusters = _kept_clusters
+cream_meta     = _kept_meta
+
+print(f"\n  Post-hoc quality gate (intra-sim ≥ {CREAM_MIN_INTRA_SIM}):")
+print(f"    Clusters kept    : {len(cream_clusters)}")
+print(f"    Clusters rejected: {_rejected_count}  ({_rejected_arts} articles → uncertified)")
 
 uncertified_ids = set(range(n)) - certified_article_ids
 
