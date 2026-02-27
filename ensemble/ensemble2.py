@@ -1,9 +1,10 @@
 """
 Phase 1 — Cross-Algorithm Ensemble Clustering
-Strategy  : Bipartite graph (Agglo ↔ Leiden) + Connected Components → Cream Clusters
-Similarity : Szymkiewicz-Simpson overlap coefficient
-Cream core : INTERSECTION of Agglo-side ∩ Leiden-side articles (double-confirmed, min 3)
-Soft edges : union − intersection → passed to Phase 2 as uncertified
+Strategy  : Tripartite graph (Agglo ↔ Leiden ↔ PLSCAN) + Connected Components → Cream Clusters
+Similarity : Szymkiewicz-Simpson overlap + Jaccard coefficient
+Consensus  : 3-of-3 algorithms must agree per article (min cluster size 3)
+  TRIPLE_CREAM → confirmed by ALL 3 algorithms (only tier)
+Soft edges : single-algo or 2-algo articles → passed to Phase 2 as uncertified
 """
 
 import os
@@ -21,6 +22,7 @@ from datetime import datetime, timedelta
 from openai import OpenAI
 from sklearn.cluster import AgglomerativeClustering
 from fast_plscan import PLSCAN
+from hdbscan import HDBSCAN
 import tiktoken
 
 load_dotenv()
@@ -36,7 +38,10 @@ LEIDEN_EDGE_SIM        = 0.70  # Cosine similarity threshold for Leiden graph ed
 AGGLO_DIST             = 1.2   # Ward distance threshold for Agglomerative
 CREAM_CONSOLIDATION_SIM = 0.78 # Phase 2A: centroid cosine sim to merge cream clusters
 ASSIGN_THRESHOLD        = 0.70 # Phase 2B: min cosine sim to nearest centroid for assignment
-ORPHAN_MIN_SAMPLES      = 3    # Phase 2B Step 2: PLSCAN min_samples on orphans
+PLSCAN_MIN_SAMPLES_P1   = 3    # Phase 1 third voter: PLSCAN min_samples on full dataset
+ORPHAN_MIN_CLUSTER_SIZE = 3    # Phase 2B Step 2: HDBSCAN min articles to form a cluster
+ORPHAN_MIN_SAMPLES      = 2    # Phase 2B Step 2: HDBSCAN core point density (lower = more clusters)
+PROV_MAX_CLUSTER_SIZE   = 50   # Phase 2B Step 2: reject provisional clusters larger than this → ISOLATED
 CREAM_MIN_INTRA_SIM     = 0.60 # Post-hoc quality gate: reject cream clusters below this mean intra-sim
 # ══════════════════════════════════════════════════════════════
 
@@ -155,7 +160,7 @@ print(f"✅ Embeddings ready — shape {embeddings.shape}")
 # ─────────────────────────────────────────────────────────────
 # STEP 3A · AGGLOMERATIVE CLUSTERING
 # ─────────────────────────────────────────────────────────────
-print("\n[1/2] Agglomerative clustering...")
+print("\n[1/3] Agglomerative clustering...")
 agglo = AgglomerativeClustering(
     n_clusters=None,
     distance_threshold=AGGLO_DIST,
@@ -177,7 +182,7 @@ print(f"   Avg size (meaningful)     : {mean_agglo.mean():.1f}  |  Max: {mean_ag
 # ─────────────────────────────────────────────────────────────
 # STEP 3B · LEIDEN CLUSTERING
 # ─────────────────────────────────────────────────────────────
-print("\n[2/2] Leiden clustering...")
+print("\n[2/3] Leiden clustering...")
 
 # Build article similarity graph
 sim  = emb_norm @ emb_norm.T
@@ -201,47 +206,84 @@ print(f"   Avg size (meaningful)     : {mean_leiden.mean():.1f}  |  Max: {mean_l
 
 
 # ─────────────────────────────────────────────────────────────
+# STEP 3C · PLSCAN CLUSTERING (third voter)
+# ─────────────────────────────────────────────────────────────
+print("\n[3/3] PLSCAN clustering (Phase 1 voter)...")
+_plscan_p1        = PLSCAN(min_samples=PLSCAN_MIN_SAMPLES_P1).fit(emb_norm)
+df["cluster_plscan"] = _plscan_p1.labels_   # -1 = noise
+
+vc_plscan   = df["cluster_plscan"].value_counts()
+sing_plscan = int((vc_plscan.index == -1).sum())          # noise points
+mean_plscan = vc_plscan[(vc_plscan.index != -1) & (vc_plscan > 1)]
+print(f"   Total clusters            : {(vc_plscan.index != -1).sum()}")
+print(f"   Noise points (-1)         : {int(vc_plscan.get(-1, 0))}  ← noise")
+print(f"   Meaningful clusters (>1)  : {len(mean_plscan)}")
+print(f"   Articles in meaningful    : {mean_plscan.sum()} / {n} ({100*mean_plscan.sum()/n:.1f}%)")
+print(f"   Avg size (meaningful)     : {mean_plscan.mean():.1f}  |  Max: {mean_plscan.max()}")
+
+
+# ─────────────────────────────────────────────────────────────
 # STEP 4 · STRIP SINGLETONS — only keep meaningful clusters
 # ─────────────────────────────────────────────────────────────
 valid_agglo  = set(mean_agglo.index)    # Agglo cluster IDs with ≥ 2 articles
 valid_leiden = set(mean_leiden.index)   # Leiden cluster IDs with ≥ 2 articles
+valid_plscan = set(mean_plscan.index)   # PLSCAN cluster IDs with ≥ 2 articles (no noise)
 
 
 # ─────────────────────────────────────────────────────────────
 # STEP 5 · BUILD INVERTED INDEX + INTERSECTION COUNTS  (O(n))
+# Three algorithm pairs: Agglo↔Leiden, Agglo↔PLSCAN, Leiden↔PLSCAN
 # ─────────────────────────────────────────────────────────────
-print("\n⏳ Building inverted index...")
+print("\n⏳ Building tripartite inverted index...")
 
 agglo_to_articles  = defaultdict(set)   # agglo_id  → {article row indices}
 leiden_to_articles = defaultdict(set)   # leiden_id → {article row indices}
-intersection_count = defaultdict(int)   # (agglo_id, leiden_id) → shared article count
+plscan_to_articles = defaultdict(set)   # plscan_id → {article row indices}
+
+inter_al = defaultdict(int)   # (agglo_id, leiden_id) → shared article count
+inter_ap = defaultdict(int)   # (agglo_id, plscan_id) → shared article count
+inter_lp = defaultdict(int)   # (leiden_id, plscan_id) → shared article count
 
 for i in range(n):
     a = df.at[i, "cluster_agglo"]
     l = df.at[i, "cluster_leiden"]
+    p = df.at[i, "cluster_plscan"]
 
-    in_valid_agglo  = a in valid_agglo
-    in_valid_leiden = l in valid_leiden
+    in_a = a in valid_agglo
+    in_l = l in valid_leiden
+    in_p = p in valid_plscan
 
-    if in_valid_agglo:
+    if in_a:
         agglo_to_articles[a].add(i)
-    if in_valid_leiden:
+    if in_l:
         leiden_to_articles[l].add(i)
-    if in_valid_agglo and in_valid_leiden:
-        intersection_count[(a, l)] += 1
+    if in_p:
+        plscan_to_articles[p].add(i)
+
+    if in_a and in_l:
+        inter_al[(a, l)] += 1
+    if in_a and in_p:
+        inter_ap[(a, p)] += 1
+    if in_l and in_p:
+        inter_lp[(l, p)] += 1
 
 agglo_sizes  = {a: len(arts) for a, arts in agglo_to_articles.items()}
 leiden_sizes = {l: len(arts) for l, arts in leiden_to_articles.items()}
+plscan_sizes = {p: len(arts) for p, arts in plscan_to_articles.items()}
 
 print(f"   Valid Agglo clusters      : {len(agglo_to_articles)}")
 print(f"   Valid Leiden clusters     : {len(leiden_to_articles)}")
-print(f"   Cross-pairs sharing ≥1 article: {len(intersection_count):,}")
+print(f"   Valid PLSCAN clusters     : {len(plscan_to_articles)}")
+print(f"   A↔L cross-pairs ≥1 article: {len(inter_al):,}")
+print(f"   A↔P cross-pairs ≥1 article: {len(inter_ap):,}")
+print(f"   L↔P cross-pairs ≥1 article: {len(inter_lp):,}")
 
 
 # ─────────────────────────────────────────────────────────────
-# STEP 6 · COMPUTE SZYMKIEWICZ-SIMPSON OVERLAP + BUILD GRAPH
+# STEP 6 · COMPUTE SZYMKIEWICZ-SIMPSON OVERLAP + BUILD TRIPARTITE GRAPH
+# Edges drawn for all three algorithm pairs: A↔L, A↔P, L↔P
 # ─────────────────────────────────────────────────────────────
-print(f"\n⏳ Computing overlap (threshold ≥ {OVERLAP_THRESHOLD})...")
+print(f"\n⏳ Computing tripartite overlap (threshold ≥ {OVERLAP_THRESHOLD})...")
 
 G = nx.Graph()
 
@@ -250,23 +292,36 @@ for a in valid_agglo:
     G.add_node(f"A_{a}", algo="agglo")
 for l in valid_leiden:
     G.add_node(f"L_{l}", algo="leiden")
+for p in valid_plscan:
+    G.add_node(f"P_{p}", algo="plscan")
 
-edge_count = 0
-for (a, l), count in intersection_count.items():
-    smaller  = min(agglo_sizes[a], leiden_sizes[l])
-    simpson  = count / smaller
-    jaccard  = count / (agglo_sizes[a] + leiden_sizes[l] - count)
-    if simpson >= OVERLAP_THRESHOLD and jaccard >= JACCARD_THRESHOLD:
-        G.add_edge(f"A_{a}", f"L_{l}", weight=simpson)
-        edge_count += 1
+def _add_edges(pairs, sizes_x, sizes_y, prefix_x, prefix_y):
+    count_added = 0
+    for (x, y), cnt in pairs.items():
+        smaller = min(sizes_x[x], sizes_y[y])
+        simpson = cnt / smaller
+        jaccard = cnt / (sizes_x[x] + sizes_y[y] - cnt)
+        if simpson >= OVERLAP_THRESHOLD and jaccard >= JACCARD_THRESHOLD:
+            G.add_edge(f"{prefix_x}{x}", f"{prefix_y}{y}", weight=simpson)
+            count_added += 1
+    return count_added
 
-print(f"   Edges drawn (Simpson ≥ {OVERLAP_THRESHOLD} AND Jaccard ≥ {JACCARD_THRESHOLD}): {edge_count}")
+edges_al = _add_edges(inter_al, agglo_sizes, leiden_sizes, "A_", "L_")
+edges_ap = _add_edges(inter_ap, agglo_sizes, plscan_sizes, "A_", "P_")
+edges_lp = _add_edges(inter_lp, leiden_sizes, plscan_sizes, "L_", "P_")
+
+print(f"   A↔L edges (Simpson ≥ {OVERLAP_THRESHOLD} AND Jaccard ≥ {JACCARD_THRESHOLD}): {edges_al}")
+print(f"   A↔P edges                                                          : {edges_ap}")
+print(f"   L↔P edges                                                          : {edges_lp}")
+print(f"   Total edges                                                        : {edges_al + edges_ap + edges_lp}")
 
 
 # ─────────────────────────────────────────────────────────────
 # STEP 7 · CONNECTED COMPONENTS → CREAM CLUSTERS
+# Consensus rule: ALL 3 algorithms must agree on an article
+#   3/3 agreement → TRIPLE_CREAM (the only certified tier)
 # ─────────────────────────────────────────────────────────────
-print("\n⏳ Finding connected components...")
+print("\n⏳ Finding connected components (tripartite, 3-of-3 consensus)...")
 
 components = list(nx.connected_components(G))
 
@@ -279,33 +334,42 @@ for comp in components:
     if len(comp) == 1:
         continue
 
-    has_agglo  = any(node.startswith("A_") for node in comp)
-    has_leiden = any(node.startswith("L_") for node in comp)
+    algos_present = set()
+    for node in comp:
+        if node.startswith("A_"):   algos_present.add("agglo")
+        elif node.startswith("L_"): algos_present.add("leiden")
+        elif node.startswith("P_"): algos_present.add("plscan")
 
-    # Only create a cream cluster if BOTH algorithms are represented
-    if not (has_agglo and has_leiden):
+    # All 3 algorithms must be represented in the component
+    if len(algos_present) < 3:
         continue
 
-    # Union all articles from each algorithm side separately
     agglo_articles  = set()
     leiden_articles = set()
-    agglo_nodes, leiden_nodes = [], []
+    plscan_articles = set()
+    agglo_nodes, leiden_nodes, plscan_nodes = [], [], []
 
     for node in comp:
         if node.startswith("A_"):
             a_id = int(node[2:])
             agglo_articles |= agglo_to_articles[a_id]
             agglo_nodes.append(a_id)
-        else:
+        elif node.startswith("L_"):
             l_id = int(node[2:])
             leiden_articles |= leiden_to_articles[l_id]
             leiden_nodes.append(l_id)
+        elif node.startswith("P_"):
+            p_id = int(node[2:])
+            plscan_articles |= plscan_to_articles[p_id]
+            plscan_nodes.append(p_id)
 
-    # INTERSECTION: only articles confirmed by BOTH algorithms
-    article_set   = agglo_articles & leiden_articles
-    soft_articles = (agglo_articles | leiden_articles) - article_set  # single-algo only
+    # 3-of-3: article must appear in ALL three algorithm-side sets
+    article_set = agglo_articles & leiden_articles & plscan_articles
 
-    # Skip if intersection is empty or too small to be credible
+    all_articles  = agglo_articles | leiden_articles | plscan_articles
+    soft_articles = all_articles - article_set   # 1 or 2-algo only → uncertified
+
+    # Skip if consensus set is too small to be credible
     if len(article_set) < 3:
         continue
 
@@ -313,8 +377,9 @@ for comp in components:
     cream_meta.append({
         "agglo_nodes"  : agglo_nodes,
         "leiden_nodes" : leiden_nodes,
+        "plscan_nodes" : plscan_nodes,
         "size"         : len(article_set),
-        "union_size"   : len(agglo_articles | leiden_articles),
+        "union_size"   : len(all_articles),
         "soft_count"   : len(soft_articles),
     })
     certified_article_ids |= article_set
@@ -359,10 +424,12 @@ uncertified_ids = set(range(n)) - certified_article_ids
 # STEP 8 · ASSIGN FINAL LABELS TO DATAFRAME
 # ─────────────────────────────────────────────────────────────
 df["cluster_cream"] = -1   # -1 = uncertified
+df["vote_count"]    = 0    # 3 for all certified articles (3/3 consensus)
 
 for cream_id, article_set in enumerate(cream_clusters):
     for idx in article_set:
         df.at[idx, "cluster_cream"] = cream_id
+        df.at[idx, "vote_count"]    = 3
 
 
 # ─────────────────────────────────────────────────────────────
@@ -372,10 +439,10 @@ cream_sizes = [m["size"] for m in cream_meta]
 vc_cream    = pd.Series(cream_sizes)
 
 print("\n" + "═" * 58)
-print("  PHASE 1 — CREAM CLUSTER RESULTS")
+print("  PHASE 1 — CREAM CLUSTER RESULTS  (3-of-3 tripartite)")
 print("═" * 58)
 print(f"  Total articles              : {n:,}")
-print(f"  Certified articles          : {len(certified_article_ids):,} ({100*len(certified_article_ids)/n:.1f}%)")
+print(f"  Certified (TRIPLE_CREAM)    : {len(certified_article_ids):,} ({100*len(certified_article_ids)/n:.1f}%)  ← all 3 algos agree")
 print(f"  Uncertified (second pass)   : {len(uncertified_ids):,} ({100*len(uncertified_ids)/n:.1f}%)")
 print(f"")
 print(f"  Cream clusters formed       : {len(cream_clusters)}")
@@ -396,17 +463,19 @@ print("\n  Top 15 largest cream clusters:")
 top15 = sorted(cream_meta, key=lambda x: x["size"], reverse=True)[:15]
 for rank, meta in enumerate(top15, 1):
     print(f"    #{rank:>2}  core={meta['size']:>4}  union={meta['union_size']:>4}  "
-          f"soft={meta['soft_count']:>3}  "
-          f"A={len(meta['agglo_nodes'])} L={len(meta['leiden_nodes'])}")
+          f"soft={meta['soft_count']:>3}")
 
 print("\n── Individual algorithm recap ────────────────────────────")
 print(f"  Agglo  : {len(mean_agglo):>4} meaningful clusters  "
       f"(of {vc_agglo.shape[0]} total, {sing_agglo} singletons)")
 print(f"  Leiden : {len(mean_leiden):>4} meaningful clusters  "
       f"(of {vc_leiden.shape[0]} total, {sing_leiden} singletons)")
+print(f"  PLSCAN : {len(mean_plscan):>4} meaningful clusters  "
+      f"(of {(vc_plscan.index != -1).sum()} total, "
+      f"{int(vc_plscan.get(-1, 0))} noise pts)")
 print("──────────────────────────────────────────────────────────")
 print(f"\n  cluster_cream = -1  → uncertified (awaits second pass)")
-print(f"  cluster_cream ≥  0  → cream cluster ID (double-voted)")
+print(f"  cluster_cream ≥  0  → cream cluster ID (TRIPLE_CREAM, all 3 agree)")
 print("═" * 58)
 
 
@@ -586,63 +655,80 @@ if len(assigned_sims) > 0:
         print(f"    {lbl} : {count:>5}  {bar}")
 
 print(f"")
-print(f"  Orphans → PLSCAN mini-clustering (Phase 2B Step 2)")
+print(f"  Orphans → HDBSCAN mini-clustering (Phase 2B Step 2)")
 print("═" * 58)
 
 
 # ─────────────────────────────────────────────────────────────
-# PHASE 2B · STEP 2 — PLSCAN ON ORPHANS
-# PLSCAN cluster (≥2 articles) → PROVISIONAL
-# PLSCAN noise (-1) or singleton → ISOLATED
+# PHASE 2B · STEP 2 — HDBSCAN ON ORPHANS
+# HDBSCAN cluster within size cap → PROVISIONAL
+# HDBSCAN noise (-1), singleton, or oversized cluster → ISOLATED
 # ─────────────────────────────────────────────────────────────
 print(f"\n{'═' * 58}")
-print("  PHASE 2B STEP 2 — PLSCAN ON ORPHANS")
+print("  PHASE 2B STEP 2 — HDBSCAN ON ORPHANS")
 print(f"{'═' * 58}")
 
 # ── Tag confidence for all articles ──────────────────────────
-df["confidence"] = "CREAM_CORE"   # default for certified articles
+# All certified articles are TRIPLE_CREAM (3/3 consensus)
+df["confidence"] = df["cluster_cream"].map(
+    lambda v: "TRIPLE_CREAM" if v >= 0 else "UNCERTIFIED"
+)
 for orig_idx, cid, sim in assigned:
     df.at[orig_idx, "confidence"] = "HIGH_ASSIGNED" if sim >= 0.75 else "SOFT_ASSIGNED"
 
-next_cluster_id = len(consolidated_clusters)  # PLSCAN gets IDs after cream IDs
+next_cluster_id = len(consolidated_clusters)  # HDBSCAN gets IDs after cream IDs
 
 if len(orphans) == 0:
     print("   No orphans — all uncertified articles assigned.")
-    prov_clusters   = 0
-    isol_count      = 0
+    prov_clusters      = 0
+    isol_count         = 0
     prov_article_count = 0
 
 elif len(orphans) == 1:
     df.at[orphans[0], "confidence"]    = "ISOLATED"
     df.at[orphans[0], "cluster_cream"] = -2
-    prov_clusters   = 0
-    isol_count      = 1
+    prov_clusters      = 0
+    isol_count         = 1
     prov_article_count = 0
 
 else:
-    print(f"⏳ Running PLSCAN (min_samples={ORPHAN_MIN_SAMPLES}) on {len(orphans)} orphans...")
+    print(f"⏳ Running HDBSCAN (min_cluster_size={ORPHAN_MIN_CLUSTER_SIZE}, "
+          f"min_samples={ORPHAN_MIN_SAMPLES}) on {len(orphans)} orphans...")
     orphan_emb_norm = emb_norm[orphans]   # already L2-normalised
-    clusterer       = PLSCAN(min_samples=ORPHAN_MIN_SAMPLES).fit(orphan_emb_norm)
-    plscan_labels   = clusterer.labels_   # -1 = noise
 
-    plscan_series = pd.Series(plscan_labels)
-    plscan_vc     = plscan_series.value_counts()
-    noise_mask    = plscan_series == -1
-    non_noise_vc  = plscan_vc[plscan_vc.index != -1]
-    prov_vc       = non_noise_vc[non_noise_vc > 1]     # meaningful (≥2 articles)
-    prov_sing_vc  = non_noise_vc[non_noise_vc == 1]    # PLSCAN singletons
+    # euclidean on L2-normalised vectors ≡ cosine distance — no extra computation needed
+    hdb = HDBSCAN(
+        min_cluster_size=ORPHAN_MIN_CLUSTER_SIZE,
+        min_samples=ORPHAN_MIN_SAMPLES,
+        metric="euclidean",
+        cluster_selection_method="eom",   # excess-of-mass: stable, avoids micro-clusters
+    ).fit(orphan_emb_norm)
+    hdb_labels = hdb.labels_   # -1 = noise
+
+    hdb_series   = pd.Series(hdb_labels)
+    hdb_vc       = hdb_series.value_counts()
+    noise_mask   = hdb_series == -1
+    non_noise_vc = hdb_vc[hdb_vc.index != -1]
+
+    # Apply size cap: clusters exceeding PROV_MAX_CLUSTER_SIZE are too broad → ISOLATED
+    prov_vc      = non_noise_vc[(non_noise_vc >= 2) & (non_noise_vc <= PROV_MAX_CLUSTER_SIZE)]
+    oversized_vc = non_noise_vc[non_noise_vc > PROV_MAX_CLUSTER_SIZE]
+    sing_vc      = non_noise_vc[non_noise_vc == 1]
 
     valid_prov_labels  = set(prov_vc.index)
     prov_clusters      = len(valid_prov_labels)
-    isol_count         = int(noise_mask.sum()) + int(len(prov_sing_vc))
+    isol_count         = int(noise_mask.sum()) + int(len(sing_vc)) + int(len(oversized_vc))
     prov_article_count = int(prov_vc.sum())
 
-    print(f"   Provisional clusters (≥2) : {prov_clusters}")
-    print(f"   PLSCAN singletons (=1)    : {len(prov_sing_vc)}  → ISOLATED")
-    print(f"   Noise points (-1)         : {int(noise_mask.sum())}  → ISOLATED")
+    print(f"   Raw HDBSCAN clusters       : {len(non_noise_vc)}")
+    print(f"   Noise points (-1)          : {int(noise_mask.sum())}  → ISOLATED")
+    print(f"   Singletons (=1)            : {len(sing_vc)}  → ISOLATED")
+    print(f"   Oversized (>{PROV_MAX_CLUSTER_SIZE} articles)    : {len(oversized_vc)}  → ISOLATED  "
+          f"({int(oversized_vc.sum())} articles)")
+    print(f"   Provisional clusters kept  : {prov_clusters}  ({prov_article_count} articles)")
 
     for i, orig_idx in enumerate(orphans):
-        lbl = int(plscan_labels[i])
+        lbl = int(hdb_labels[i])
         if lbl == -1 or lbl not in valid_prov_labels:
             df.at[orig_idx, "confidence"]    = "ISOLATED"
             df.at[orig_idx, "cluster_cream"] = -2
@@ -650,18 +736,44 @@ else:
             df.at[orig_idx, "confidence"]    = "PROVISIONAL"
             df.at[orig_idx, "cluster_cream"] = next_cluster_id + lbl
 
+    # ── Post-hoc quality gate on PROVISIONAL clusters ────────
+    # Rejects provisional clusters whose mean pairwise intra-sim
+    # falls below CREAM_MIN_INTRA_SIM — same bar as cream clusters.
+    _prov_rejected = 0
+    _prov_rej_arts = 0
+    prov_cids = df[df["confidence"] == "PROVISIONAL"]["cluster_cream"].unique()
+    for _pcid in prov_cids:
+        _pidxs = df[df["cluster_cream"] == _pcid].index.tolist()
+        _pvecs = emb_norm[_pidxs]
+        _psmat = _pvecs @ _pvecs.T
+        _pupper = _psmat[np.triu_indices(len(_pidxs), k=1)]
+        _pmsim = float(_pupper.mean()) if len(_pupper) > 0 else 0.0
+        if _pmsim < CREAM_MIN_INTRA_SIM:
+            for _pidx in _pidxs:
+                df.at[_pidx, "confidence"]    = "ISOLATED"
+                df.at[_pidx, "cluster_cream"] = -2
+            _prov_rejected += 1
+            _prov_rej_arts += len(_pidxs)
+
+    prov_clusters      -= _prov_rejected
+    prov_article_count -= _prov_rej_arts
+    isol_count         += _prov_rej_arts
+    print(f"   Prov quality gate (intra-sim ≥ {CREAM_MIN_INTRA_SIM}):")
+    print(f"     Rejected : {_prov_rejected} clusters  ({_prov_rej_arts} articles → ISOLATED)")
+    print(f"     Kept     : {prov_clusters} clusters  ({prov_article_count} articles)")
+
 
 # ─────────────────────────────────────────────────────────────
 # FULL PIPELINE SUMMARY
 # ─────────────────────────────────────────────────────────────
 conf_counts = df["confidence"].value_counts()
 
-cream_core_count  = int(conf_counts.get("CREAM_CORE",    0))
-high_assigned     = int(conf_counts.get("HIGH_ASSIGNED", 0))
-soft_assigned     = int(conf_counts.get("SOFT_ASSIGNED", 0))
-provisional_count = int(conf_counts.get("PROVISIONAL",   0))
-isolated_count    = int(conf_counts.get("ISOLATED",      0))
-effective_cov     = cream_core_count + high_assigned + soft_assigned + provisional_count
+triple_cream_count = int(conf_counts.get("TRIPLE_CREAM",  0))
+high_assigned      = int(conf_counts.get("HIGH_ASSIGNED", 0))
+soft_assigned      = int(conf_counts.get("SOFT_ASSIGNED", 0))
+provisional_count  = int(conf_counts.get("PROVISIONAL",   0))
+isolated_count     = int(conf_counts.get("ISOLATED",      0))
+effective_cov      = triple_cream_count + high_assigned + soft_assigned + provisional_count
 
 # Clusters with real IDs (cream + provisional; exclude ISOLATED=-2)
 real_clusters_df    = df[df["cluster_cream"] >= 0]
@@ -675,10 +787,10 @@ print(f"  Total articles processed       : {n:,}")
 print(f"  Total meaningful clusters      : {total_final_clusters:,}")
 print(f"")
 print(f"  Article confidence breakdown:")
-print(f"    CREAM_CORE    : {cream_core_count:>5}  ({100*cream_core_count/n:.1f}%)  ← Phase 1 double-voted")
+print(f"    TRIPLE_CREAM  : {triple_cream_count:>5}  ({100*triple_cream_count/n:.1f}%)  ← Phase 1 all 3 algos agree")
 print(f"    HIGH_ASSIGNED : {high_assigned:>5}  ({100*high_assigned/n:.1f}%)  ← Phase 2B sim ≥ 0.75")
 print(f"    SOFT_ASSIGNED : {soft_assigned:>5}  ({100*soft_assigned/n:.1f}%)  ← Phase 2B sim 0.65–0.74")
-print(f"    PROVISIONAL   : {provisional_count:>5}  ({100*provisional_count/n:.1f}%)  ← PLSCAN orphan cluster")
+print(f"    PROVISIONAL   : {provisional_count:>5}  ({100*provisional_count/n:.1f}%)  ← HDBSCAN orphan cluster")
 print(f"    ISOLATED      : {isolated_count:>5}  ({100*isolated_count/n:.1f}%)  ← true loners (noise)")
 print(f"")
 print(f"  Effective coverage             : {effective_cov:,} / {n:,}  ({100*effective_cov/n:.1f}%)")
@@ -686,7 +798,7 @@ print(f"  Effective coverage             : {effective_cov:,} / {n:,}  ({100*effe
 print(f"")
 print(f"  Cluster count breakdown:")
 print(f"    Cream clusters  (Phase 1+2A) : {len(consolidated_clusters):>5}")
-print(f"    Provisional clusters (PLSCAN): {prov_clusters:>5}")
+print(f"    Provisional clusters (HDBSCAN): {prov_clusters:>5}")
 print(f"    ─────────────────────────────────")
 print(f"    Total meaningful clusters    : {total_final_clusters:>5}")
 print(f"    Isolated articles (no cluster): {isolated_count:>4}")
@@ -761,18 +873,18 @@ overall_mean   = intra_df["mean_sim"].mean()
 overall_median = intra_df["mean_sim"].median()
 
 # Per-tier breakdown
-cream_rows = intra_df[intra_df["tier"] == "CREAM_CORE"]
-prov_rows  = intra_df[intra_df["tier"] == "PROVISIONAL"]
-ha_rows    = intra_df[intra_df["tier"].isin(["HIGH_ASSIGNED", "SOFT_ASSIGNED"])]
+triple_rows = intra_df[intra_df["tier"] == "TRIPLE_CREAM"]
+prov_rows   = intra_df[intra_df["tier"] == "PROVISIONAL"]
+ha_rows     = intra_df[intra_df["tier"].isin(["HIGH_ASSIGNED", "SOFT_ASSIGNED"])]
 
 print(f"\n  Clusters evaluated          : {len(intra_df):,}")
 print(f"  Overall mean intra-sim      : {overall_mean:.4f}")
 print(f"  Overall median intra-sim    : {overall_median:.4f}")
 print(f"")
 print(f"  By dominant confidence tier:")
-if len(cream_rows):
-    print(f"    CREAM_CORE    : mean={cream_rows['mean_sim'].mean():.4f}  "
-          f"median={cream_rows['mean_sim'].median():.4f}  (n={len(cream_rows)})")
+if len(triple_rows):
+    print(f"    TRIPLE_CREAM  : mean={triple_rows['mean_sim'].mean():.4f}  "
+          f"median={triple_rows['mean_sim'].median():.4f}  (n={len(triple_rows)})")
 if len(ha_rows):
     print(f"    ASSIGNED      : mean={ha_rows['mean_sim'].mean():.4f}  "
           f"median={ha_rows['mean_sim'].median():.4f}  (n={len(ha_rows)})")
@@ -822,7 +934,7 @@ out_path = os.path.join(os.path.dirname(__file__), "cluster_output.csv")
 output_cols = [
     "symbol", "title", "publish_date", "site",
     "sentiment", "sentimentscore",
-    "cluster_cream", "confidence",
+    "cluster_cream", "confidence", "vote_count",
 ]
 df[output_cols].to_csv(out_path, index=False)
 print(f"\n✅ Saved {n:,} articles → {out_path}")
