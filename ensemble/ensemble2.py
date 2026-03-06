@@ -8,8 +8,8 @@ Soft edges : single-algo or 2-algo articles → passed to Phase 2 as uncertified
 """
 
 import os
-import hashlib
-import pickle
+import threading
+from concurrent.futures import ThreadPoolExecutor
 import psycopg2
 import pandas as pd
 import numpy as np
@@ -23,6 +23,7 @@ from openai import OpenAI
 from sklearn.cluster import AgglomerativeClustering
 from fast_plscan import PLSCAN
 from hdbscan import HDBSCAN
+from joblib import Parallel, delayed
 import tiktoken
 
 load_dotenv()
@@ -31,14 +32,14 @@ client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
 # ══════════════════════════════════════════════════════════════
 # CONFIG
 # ══════════════════════════════════════════════════════════════
-DAYS                   = 1
+DAYS                   = 2
 OVERLAP_THRESHOLD      = 0.95  # Szymkiewicz-Simpson threshold for cross-algo edge (max possible = 1.0)
 JACCARD_THRESHOLD      = 0.2  # Jaccard threshold — kills imbalanced pairs (tiny ∩ big)
 LEIDEN_EDGE_SIM        = 0.70  # Cosine similarity threshold for Leiden graph edges
 AGGLO_DIST             = 1.2   # Ward distance threshold for Agglomerative
 CREAM_CONSOLIDATION_SIM = 0.78 # Phase 2A: centroid cosine sim to merge cream clusters
 ASSIGN_THRESHOLD        = 0.70 # Phase 2B: min cosine sim to nearest centroid for assignment
-PLSCAN_MIN_SAMPLES_P1   = 3    # Phase 1 third voter: PLSCAN min_samples on full dataset
+PLSCAN_MIN_SAMPLES_P1   = 2    # Phase 1 third voter: PLSCAN min_samples on full dataset
 ORPHAN_MIN_CLUSTER_SIZE = 3    # Phase 2B Step 2: HDBSCAN min articles to form a cluster
 ORPHAN_MIN_SAMPLES      = 2    # Phase 2B Step 2: HDBSCAN core point density (lower = more clusters)
 PROV_MAX_CLUSTER_SIZE   = 50   # Phase 2B Step 2: reject provisional clusters larger than this → ISOLATED
@@ -95,10 +96,17 @@ def truncate_tokens(text: str) -> str:
         text = text[:4_000]   # 4k chars ≈ 1-4k tokens — always safe
     return text
 
+_emb_tokens = 0                     # cumulative embedding tokens for cost tracking
+_tok_lock   = threading.Lock()      # protects _emb_tokens across parallel threads
+
 def embed_batch(texts):
+    global _emb_tokens
     safe = [truncate_tokens(t) for t in texts]
     try:
         resp = client.embeddings.create(model="text-embedding-3-small", input=safe)
+        if resp.usage:
+            with _tok_lock:
+                _emb_tokens += resp.usage.total_tokens
         return [d.embedding for d in resp.data]
     except Exception:
         # If batch fails, fall back to one-at-a-time to isolate the problem text
@@ -106,8 +114,15 @@ def embed_batch(texts):
         for t in safe:
             t = t[:8_000]  # hard char fallback
             resp = client.embeddings.create(model="text-embedding-3-small", input=[t])
+            if resp.usage:
+                with _tok_lock:
+                    _emb_tokens += resp.usage.total_tokens
             results.append(resp.data[0].embedding)
         return results
+
+def _embed_range(start: int, end: int) -> list:
+    """Embed one batch [start:end] — called in parallel threads."""
+    return embed_batch(df["embed_text"].iloc[start:end].tolist())
 
 df["title_clean"]  = df["title"].map(clean)
 df["text_clean"]   = df["text"].map(clean).str.slice(0, 25_000)
@@ -115,41 +130,23 @@ df["symbol_clean"] = df["symbol"].fillna("").astype(str).str.strip()
 df["embed_text"]   = df["symbol_clean"] + "\n" + df["title_clean"] + "\n" + df["title_clean"] + "\n" + df["text_clean"]
 df["embed_text"]   = df["embed_text"].map(truncate_tokens)
 
-# ── Embedding cache (per-article, date-scoped) ───────────────
-# Key   = hash(title + publish_date) — stable across runs even when new
-#         articles arrive.  Only truly new articles hit the API.
-_cache_dir  = os.path.dirname(__file__)
-_cache_date = since.strftime("%Y-%m-%d")
-_cache_path = os.path.join(_cache_dir, f"embedding_cache_{_cache_date}.pkl")
+# ── Embed all articles via API (parallel batches) ────────────
+_BATCH       = 100
+_N_JOBS      = -1   # use all CPU threads (I/O-bound → threading backend)
+_batch_ranges = [(s, min(s + _BATCH, n)) for s in range(0, n, _BATCH)]
 
-def _article_key(row):
-    raw = str(row["title"]) + str(row["publish_date"])
-    return hashlib.md5(raw.encode()).hexdigest()
+print(f"\n⏳ Embedding {n:,} articles via API — "
+      f"{len(_batch_ranges)} batches × {_BATCH}, {_N_JOBS} parallel workers...")
 
-# Load existing cache (dict: key → list[float])
-if os.path.exists(_cache_path):
-    with open(_cache_path, "rb") as _f:
-        _emb_cache = pickle.load(_f)
-    print(f"\n✅ Loaded embedding cache ({len(_emb_cache):,} entries) from {_cache_path}")
-else:
-    _emb_cache = {}
-    print(f"\n📭 No embedding cache found — will build from scratch.")
+_batch_results = Parallel(n_jobs=_N_JOBS, backend="threading", verbose=0)(
+    delayed(_embed_range)(s, e) for s, e in _batch_ranges
+)
 
-# Identify which articles are in cache vs new
-df["_cache_key"] = df.apply(_article_key, axis=1)
-_missing_mask    = ~df["_cache_key"].isin(_emb_cache)
+# joblib Parallel preserves insertion order, so just flatten
+_all_vecs = [vec for batch in _batch_results for vec in batch]
+print(f"✅ Embedded {n:,} articles  ({_emb_tokens:,} tokens)")
 
-print(f"   Cache hits   : {(~_missing_mask).sum():,}")
-print(f"   Skipped (no cache): {_missing_mask.sum():,}  ← new articles dropped, using cache only")
-
-# Drop articles not in cache — use cached embeddings only, no API calls
-if _missing_mask.any():
-    df = df[~_missing_mask].reset_index(drop=True)
-    n  = len(df)
-    print(f"   Working with   : {n:,} articles (cache-only mode)")
-
-df["embedding"] = [np.array(_emb_cache[k], dtype=np.float32) for k in df["_cache_key"]]
-df.drop(columns=["_cache_key"], inplace=True)
+df["embedding"] = [np.array(v, dtype=np.float32) for v in _all_vecs]
 
 embeddings = np.vstack(df["embedding"].values)
 norms      = np.linalg.norm(embeddings, axis=1, keepdims=True)
@@ -158,17 +155,48 @@ print(f"✅ Embeddings ready — shape {embeddings.shape}")
 
 
 # ─────────────────────────────────────────────────────────────
-# STEP 3A · AGGLOMERATIVE CLUSTERING
+# STEP 3 · RUN ALL THREE CLUSTERING ALGORITHMS IN PARALLEL
+# Each is a C/C++ extension that releases the GIL → threading
+# gives real CPU concurrency with no data-copy overhead.
+# Results are written to df only after all three finish.
 # ─────────────────────────────────────────────────────────────
-print("\n[1/3] Agglomerative clustering...")
-agglo = AgglomerativeClustering(
-    n_clusters=None,
-    distance_threshold=AGGLO_DIST,
-    linkage="ward",
-    metric="euclidean",
-)
-df["cluster_agglo"] = agglo.fit_predict(embeddings)
 
+def _run_agglo() -> np.ndarray:
+    model = AgglomerativeClustering(
+        n_clusters=None,
+        distance_threshold=AGGLO_DIST,
+        linkage="ward",
+        metric="euclidean",
+    )
+    return model.fit_predict(embeddings)
+
+def _run_leiden() -> list:
+    sim_l = emb_norm @ emb_norm.T
+    rows_l, cols_l = np.where(np.triu(sim_l >= LEIDEN_EDGE_SIM, k=1))
+    G_l = ig.Graph(n=n, edges=list(zip(rows_l.tolist(), cols_l.tolist())))
+    G_l.es["weight"] = sim_l[rows_l, cols_l].tolist()
+    part = leidenalg.find_partition(
+        G_l, leidenalg.ModularityVertexPartition, weights="weight", seed=42
+    )
+    return part.membership
+
+def _run_plscan() -> np.ndarray:
+    return PLSCAN(min_samples=PLSCAN_MIN_SAMPLES_P1).fit(emb_norm).labels_
+
+print("\n⏳ Running Agglo + Leiden + PLSCAN in parallel (3 threads)...")
+with ThreadPoolExecutor(max_workers=3) as _pool:
+    _fut_agglo  = _pool.submit(_run_agglo)
+    _fut_leiden = _pool.submit(_run_leiden)
+    _fut_plscan = _pool.submit(_run_plscan)
+    # .result() blocks until each thread finishes; exceptions are re-raised here
+    df["cluster_agglo"]  = _fut_agglo.result()
+    df["cluster_leiden"] = _fut_leiden.result()
+    df["cluster_plscan"] = _fut_plscan.result()
+
+print("✅ All three algorithms finished.\n")
+
+# ── [1/3] Agglo stats ────────────────────────────────────────
+print("[1/3] Agglomerative clustering stats:")
 vc_agglo   = df["cluster_agglo"].value_counts()
 sing_agglo = (vc_agglo == 1).sum()
 mean_agglo = vc_agglo[vc_agglo > 1]
@@ -178,23 +206,8 @@ print(f"   Meaningful clusters (>1)  : {len(mean_agglo)}")
 print(f"   Articles in meaningful    : {mean_agglo.sum()} / {n} ({100*mean_agglo.sum()/n:.1f}%)")
 print(f"   Avg size (meaningful)     : {mean_agglo.mean():.1f}  |  Max: {mean_agglo.max()}")
 
-
-# ─────────────────────────────────────────────────────────────
-# STEP 3B · LEIDEN CLUSTERING
-# ─────────────────────────────────────────────────────────────
-print("\n[2/3] Leiden clustering...")
-
-# Build article similarity graph
-sim  = emb_norm @ emb_norm.T
-rows, cols = np.where(np.triu(sim >= LEIDEN_EDGE_SIM, k=1))
-G_leiden   = ig.Graph(n=n, edges=list(zip(rows.tolist(), cols.tolist())))
-G_leiden.es["weight"] = sim[rows, cols].tolist()
-
-partition = leidenalg.find_partition(
-    G_leiden, leidenalg.ModularityVertexPartition, weights="weight", seed=42
-)
-df["cluster_leiden"] = partition.membership
-
+# ── [2/3] Leiden stats ───────────────────────────────────────
+print("\n[2/3] Leiden clustering stats:")
 vc_leiden   = df["cluster_leiden"].value_counts()
 sing_leiden = (vc_leiden == 1).sum()
 mean_leiden = vc_leiden[vc_leiden > 1]
@@ -204,16 +217,10 @@ print(f"   Meaningful clusters (>1)  : {len(mean_leiden)}")
 print(f"   Articles in meaningful    : {mean_leiden.sum()} / {n} ({100*mean_leiden.sum()/n:.1f}%)")
 print(f"   Avg size (meaningful)     : {mean_leiden.mean():.1f}  |  Max: {mean_leiden.max()}")
 
-
-# ─────────────────────────────────────────────────────────────
-# STEP 3C · PLSCAN CLUSTERING (third voter)
-# ─────────────────────────────────────────────────────────────
-print("\n[3/3] PLSCAN clustering (Phase 1 voter)...")
-_plscan_p1        = PLSCAN(min_samples=PLSCAN_MIN_SAMPLES_P1).fit(emb_norm)
-df["cluster_plscan"] = _plscan_p1.labels_   # -1 = noise
-
+# ── [3/3] PLSCAN stats ───────────────────────────────────────
+print("\n[3/3] PLSCAN clustering stats (Phase 1 voter):")
 vc_plscan   = df["cluster_plscan"].value_counts()
-sing_plscan = int((vc_plscan.index == -1).sum())          # noise points
+sing_plscan = int((vc_plscan.index == -1).sum())
 mean_plscan = vc_plscan[(vc_plscan.index != -1) & (vc_plscan > 1)]
 print(f"   Total clusters            : {(vc_plscan.index != -1).sum()}")
 print(f"   Noise points (-1)         : {int(vc_plscan.get(-1, 0))}  ← noise")
@@ -927,14 +934,60 @@ print("═" * 58)
 
 
 # ─────────────────────────────────────────────────────────────
-# SAVE OUTPUT TO CSV
+# SAVE OUTPUT TO CSV  (sorted: strongest clusters first)
+# Sort order:
+#   1. confidence tier  (TRIPLE_CREAM → HIGH → SOFT → PROVISIONAL → ISOLATED)
+#   2. cluster size     (larger cluster = more sites = more important story)
+#   3. cluster_cream ID (stable grouping within same tier+size)
 # ─────────────────────────────────────────────────────────────
 out_path = os.path.join(os.path.dirname(__file__), "cluster_output.csv")
+
+_tier_rank = {
+    "TRIPLE_CREAM" : 1,
+    "HIGH_ASSIGNED": 2,
+    "SOFT_ASSIGNED": 3,
+    "PROVISIONAL"  : 4,
+    "ISOLATED"     : 5,
+    "UNCERTIFIED"  : 6,
+}
+
+# Map each cluster to its total article count (ISOLATED articles use size=1)
+_cluster_size = (
+    df[df["cluster_cream"] >= 0]
+    .groupby("cluster_cream")
+    .size()
+    .to_dict()
+)
+
+df["_tier_rank"]    = df["confidence"].map(_tier_rank).fillna(6).astype(int)
+df["_cluster_size"] = df["cluster_cream"].map(_cluster_size).fillna(1).astype(int)
 
 output_cols = [
     "symbol", "title", "publish_date", "site",
     "sentiment", "sentimentscore",
     "cluster_cream", "confidence", "vote_count",
 ]
-df[output_cols].to_csv(out_path, index=False)
+
+df_out = (
+    df[output_cols + ["_tier_rank", "_cluster_size"]]
+    .sort_values(
+        ["_tier_rank", "_cluster_size", "cluster_cream"],
+        ascending=[True, False, True],
+    )
+    .drop(columns=["_tier_rank", "_cluster_size"])
+)
+
+df_out.to_csv(out_path, index=False)
 print(f"\n✅ Saved {n:,} articles → {out_path}")
+print(f"   Row order: TRIPLE_CREAM (largest→smallest) → HIGH → SOFT → PROVISIONAL → ISOLATED")
+
+# ── EMBEDDING COST SUMMARY ────────────────────────────────────
+_EMB_PRICE_PER_1M = 0.02   # text-embedding-3-small: $0.02 / 1M tokens
+_emb_cost = (_emb_tokens / 1_000_000) * _EMB_PRICE_PER_1M
+print(f"\n{'─' * 40}")
+print(f"  💰 ensemble2.py cost summary")
+print(f"{'─' * 40}")
+print(f"  Model          : text-embedding-3-small")
+print(f"  Tokens used    : {_emb_tokens:,}")
+print(f"  Total cost     : ${_emb_cost:.5f}  (~${_emb_cost*30:.3f}/month @ daily runs)")
+print(f"{'─' * 40}")
