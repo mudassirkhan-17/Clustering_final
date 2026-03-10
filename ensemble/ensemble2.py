@@ -8,6 +8,8 @@ Soft edges : single-algo or 2-algo articles → passed to Phase 2 as uncertified
 """
 
 import os
+import hashlib
+import pickle
 import threading
 from concurrent.futures import ThreadPoolExecutor
 import psycopg2
@@ -66,11 +68,29 @@ conn.close()
 
 df = df.reset_index(drop=True)   # clean 0-based index throughout
 df["publish_date"] = pd.to_datetime(df["publish_date"])
-n = len(df)
 
-print(f"✅ Fetched {n:,} articles from last {DAYS} day(s)")
+print(f"✅ Fetched {len(df):,} articles from last {DAYS} day(s)")
 print(f"   Date range    : {df['publish_date'].min()} → {df['publish_date'].max()}")
 print(f"   Unique tickers: {df['symbol'].nunique()}")
+
+# ── Deduplication (before clustering) ────────────────────────
+# Key: first 80 chars of title (catches same article stored with
+# truncated vs full title) + site. Keeps the longest title version.
+_before_dedup = len(df)
+df["_title_key"] = df["title"].fillna("").str.strip().str[:200]
+df = (
+    df.sort_values("title", key=lambda s: s.str.len(), ascending=False)
+      .drop_duplicates(subset=["_title_key", "site"], keep="first")
+      .drop(columns=["_title_key"])
+      .reset_index(drop=True)
+)
+_deduped = _before_dedup - len(df)
+print(f"\n🧹 Deduplication (title[:80] + site):")
+print(f"   Before : {_before_dedup:,}")
+print(f"   Removed: {_deduped:,}  ({100*_deduped/_before_dedup:.1f}% duplicates)")
+print(f"   After  : {len(df):,}  ← used for clustering")
+
+n = len(df)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -120,33 +140,106 @@ def embed_batch(texts):
             results.append(resp.data[0].embedding)
         return results
 
-def _embed_range(start: int, end: int) -> list:
-    """Embed one batch [start:end] — called in parallel threads."""
-    return embed_batch(df["embed_text"].iloc[start:end].tolist())
+# ── Rolling embedding cache helpers ──────────────────────────
+# Cache persists between daily runs. Each entry stores the embedding
+# vector and its publish_date so stale entries can be evicted.
+_CACHE_PATH = os.path.join(os.path.dirname(__file__), "embedding_cache.pkl")
 
+def _article_hash(title: str, publish_date) -> str:
+    """Stable unique key per article: md5(title|publish_date)."""
+    return hashlib.md5(f"{title}|{publish_date}".encode()).hexdigest()
+
+def _load_cache() -> dict:
+    """Load rolling cache from disk; return {} if missing or corrupt."""
+    if not os.path.exists(_CACHE_PATH):
+        return {}
+    try:
+        with open(_CACHE_PATH, "rb") as _f:
+            return pickle.load(_f)
+    except Exception:
+        return {}
+
+def _save_cache(cache: dict) -> None:
+    """Atomic save: write to .tmp then os.replace — crash-safe."""
+    _tmp = _CACHE_PATH + ".tmp"
+    with open(_tmp, "wb") as _f:
+        pickle.dump(cache, _f, protocol=pickle.HIGHEST_PROTOCOL)
+    os.replace(_tmp, _CACHE_PATH)
+
+def _embed_miss_batch(idx_batch: list) -> tuple:
+    """Embed cache-miss rows; returns (row_indices, vectors)."""
+    texts = [df.at[i, "embed_text"] for i in idx_batch]
+    return idx_batch, embed_batch(texts)
+
+# ── Clean text ───────────────────────────────────────────────
 df["title_clean"]  = df["title"].map(clean)
 df["text_clean"]   = df["text"].map(clean).str.slice(0, 25_000)
 df["symbol_clean"] = df["symbol"].fillna("").astype(str).str.strip()
 df["embed_text"]   = df["symbol_clean"] + "\n" + df["title_clean"] + "\n" + df["title_clean"] + "\n" + df["text_clean"]
 df["embed_text"]   = df["embed_text"].map(truncate_tokens)
 
-# ── Embed all articles via API (parallel batches) ────────────
-_BATCH       = 100
-_N_JOBS      = -1   # use all CPU threads (I/O-bound → threading backend)
-_batch_ranges = [(s, min(s + _BATCH, n)) for s in range(0, n, _BATCH)]
+# ── Rolling cache: load → evict stale → serve hits → embed misses ──
+_emb_cache    = _load_cache()
+_cache_before = len(_emb_cache)
 
-print(f"\n⏳ Embedding {n:,} articles via API — "
-      f"{len(_batch_ranges)} batches × {_BATCH}, {_N_JOBS} parallel workers...")
+# Evict entries outside the DAYS window (same cutoff as the SQL query)
+_emb_cache = {
+    h: v for h, v in _emb_cache.items()
+    if pd.to_datetime(v["publish_date"]) >= since
+}
+_evicted = _cache_before - len(_emb_cache)
 
-_batch_results = Parallel(n_jobs=_N_JOBS, backend="threading", verbose=0)(
-    delayed(_embed_range)(s, e) for s, e in _batch_ranges
-)
+print(f"\n📦 Embedding cache: {_cache_before:,} loaded  |  "
+      f"{_evicted:,} evicted (>{DAYS}d old)  |  {len(_emb_cache):,} live")
 
-# joblib Parallel preserves insertion order, so just flatten
-_all_vecs = [vec for batch in _batch_results for vec in batch]
-print(f"✅ Embedded {n:,} articles  ({_emb_tokens:,} tokens)")
+# Hash every article in the current fetch
+df["_hash"] = [
+    _article_hash(str(row.title), row.publish_date)
+    for row in df[["title", "publish_date"]].itertuples(index=False)
+]
 
-df["embedding"] = [np.array(v, dtype=np.float32) for v in _all_vecs]
+_hit_idx  = [i for i in range(n) if df.at[i, "_hash"] in _emb_cache]
+_miss_idx = [i for i in range(n) if df.at[i, "_hash"] not in _emb_cache]
+
+print(f"   Cache hits  (skip API)    : {len(_hit_idx):,}")
+print(f"   Cache misses (embed now)  : {len(_miss_idx):,}")
+
+# Pre-allocate — fill hits from cache, misses from API
+_all_vecs: list = [None] * n
+
+for _i in _hit_idx:
+    _all_vecs[_i] = _emb_cache[df.at[_i, "_hash"]]["embedding"]
+
+if _miss_idx:
+    _BATCH        = 100
+    _N_JOBS       = -1
+    _miss_batches = [_miss_idx[s:s + _BATCH] for s in range(0, len(_miss_idx), _BATCH)]
+
+    print(f"\n⏳ Embedding {len(_miss_idx):,} new articles via API "
+          f"({len(_miss_batches)} batches, parallel)...")
+
+    _miss_results = Parallel(n_jobs=_N_JOBS, backend="threading", verbose=0)(
+        delayed(_embed_miss_batch)(batch) for batch in _miss_batches
+    )
+
+    for _idx_batch, _vecs in _miss_results:
+        for _i, _vec in zip(_idx_batch, _vecs):
+            _arr = np.array(_vec, dtype=np.float32)
+            _all_vecs[_i] = _arr
+            _emb_cache[df.at[_i, "_hash"]] = {
+                "embedding"   : _arr,
+                "publish_date": df.at[_i, "publish_date"],
+            }
+
+    print(f"✅ Embedded {len(_miss_idx):,} new articles  ({_emb_tokens:,} tokens)")
+else:
+    print(f"✅ All {n:,} articles served from cache  (0 API tokens used)")
+
+# Save updated cache atomically
+_save_cache(_emb_cache)
+print(f"   Cache saved: {len(_emb_cache):,} entries → {os.path.basename(_CACHE_PATH)}")
+
+df["embedding"] = _all_vecs
 
 embeddings = np.vstack(df["embedding"].values)
 norms      = np.linalg.norm(embeddings, axis=1, keepdims=True)
@@ -228,13 +321,24 @@ print(f"   Meaningful clusters (>1)  : {len(mean_plscan)}")
 print(f"   Articles in meaningful    : {mean_plscan.sum()} / {n} ({100*mean_plscan.sum()/n:.1f}%)")
 print(f"   Avg size (meaningful)     : {mean_plscan.mean():.1f}  |  Max: {mean_plscan.max()}")
 
+# ── PLSCAN failure detection ──────────────────────────────────
+# PLSCAN is considered failed if it produces fewer than 20 meaningful
+# clusters (e.g. collapses into a few giant blobs on sparse datasets).
+# Fallback: drop to Agglo+Leiden 2/3 consensus for Phase 1.
+_PLSCAN_MIN_CLUSTERS = 20
+_plscan_ok = len(mean_plscan) >= _PLSCAN_MIN_CLUSTERS
+if not _plscan_ok:
+    print(f"\n⚠️  PLSCAN FALLBACK: only {len(mean_plscan)} meaningful cluster(s) "
+          f"(need ≥ {_PLSCAN_MIN_CLUSTERS}) — switching to Agglo+Leiden 2/3 consensus")
+
 
 # ─────────────────────────────────────────────────────────────
 # STEP 4 · STRIP SINGLETONS — only keep meaningful clusters
 # ─────────────────────────────────────────────────────────────
 valid_agglo  = set(mean_agglo.index)    # Agglo cluster IDs with ≥ 2 articles
 valid_leiden = set(mean_leiden.index)   # Leiden cluster IDs with ≥ 2 articles
-valid_plscan = set(mean_plscan.index)   # PLSCAN cluster IDs with ≥ 2 articles (no noise)
+# When PLSCAN failed, use empty set → no P_ nodes added → no A↔P / L↔P edges
+valid_plscan = set(mean_plscan.index) if _plscan_ok else set()
 
 
 # ─────────────────────────────────────────────────────────────
@@ -325,10 +429,11 @@ print(f"   Total edges                                                        : 
 
 # ─────────────────────────────────────────────────────────────
 # STEP 7 · CONNECTED COMPONENTS → CREAM CLUSTERS
-# Consensus rule: ALL 3 algorithms must agree on an article
-#   3/3 agreement → TRIPLE_CREAM (the only certified tier)
+# Normal  : 3/3 consensus (Agglo + Leiden + PLSCAN)
+# Fallback: 2/3 consensus (Agglo + Leiden only, PLSCAN failed)
 # ─────────────────────────────────────────────────────────────
-print("\n⏳ Finding connected components (tripartite, 3-of-3 consensus)...")
+_consensus_mode = "3/3 (tripartite)" if _plscan_ok else "2/3 (Agglo+Leiden fallback)"
+print(f"\n⏳ Finding connected components ({_consensus_mode})...")
 
 components = list(nx.connected_components(G))
 
@@ -347,8 +452,9 @@ for comp in components:
         elif node.startswith("L_"): algos_present.add("leiden")
         elif node.startswith("P_"): algos_present.add("plscan")
 
-    # All 3 algorithms must be represented in the component
-    if len(algos_present) < 3:
+    # Require 3/3 normally; 2/3 (Agglo+Leiden only) when PLSCAN failed
+    _min_algos = 3 if _plscan_ok else 2
+    if len(algos_present) < _min_algos:
         continue
 
     agglo_articles  = set()
@@ -370,8 +476,11 @@ for comp in components:
             plscan_articles |= plscan_to_articles[p_id]
             plscan_nodes.append(p_id)
 
-    # 3-of-3: article must appear in ALL three algorithm-side sets
-    article_set = agglo_articles & leiden_articles & plscan_articles
+    # Intersection: all 3 when PLSCAN ok; Agglo∩Leiden only when fallback
+    if _plscan_ok:
+        article_set = agglo_articles & leiden_articles & plscan_articles
+    else:
+        article_set = agglo_articles & leiden_articles
 
     all_articles  = agglo_articles | leiden_articles | plscan_articles
     soft_articles = all_articles - article_set   # 1 or 2-algo only → uncertified
@@ -446,7 +555,7 @@ cream_sizes = [m["size"] for m in cream_meta]
 vc_cream    = pd.Series(cream_sizes)
 
 print("\n" + "═" * 58)
-print("  PHASE 1 — CREAM CLUSTER RESULTS  (3-of-3 tripartite)")
+print(f"  PHASE 1 — CREAM CLUSTER RESULTS  ({_consensus_mode})")
 print("═" * 58)
 print(f"  Total articles              : {n:,}")
 print(f"  Certified (TRIPLE_CREAM)    : {len(certified_article_ids):,} ({100*len(certified_article_ids)/n:.1f}%)  ← all 3 algos agree")
@@ -988,6 +1097,7 @@ print(f"\n{'─' * 40}")
 print(f"  💰 ensemble2.py cost summary")
 print(f"{'─' * 40}")
 print(f"  Model          : text-embedding-3-small")
+print(f"  Articles total : {n:,}  (hits={len(_hit_idx):,}  misses={len(_miss_idx):,})")
 print(f"  Tokens used    : {_emb_tokens:,}")
 print(f"  Total cost     : ${_emb_cost:.5f}  (~${_emb_cost*30:.3f}/month @ daily runs)")
 print(f"{'─' * 40}")
