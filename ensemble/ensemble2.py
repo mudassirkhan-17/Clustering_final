@@ -8,6 +8,7 @@ Soft edges : single-algo or 2-algo articles → passed to Phase 2 as uncertified
 """
 
 import os
+import json
 import hashlib
 import pickle
 import threading
@@ -1089,6 +1090,59 @@ df_out = (
 df_out.to_csv(out_path, index=False)
 print(f"\n✅ Saved {n:,} articles → {out_path}")
 print(f"   Row order: TRIPLE_CREAM (largest→smallest) → HIGH → SOFT → PROVISIONAL → ISOLATED")
+
+# ─────────────────────────────────────────────────────────────
+# SAVE INTRADAY STATE
+# Saves frozen centroids + cluster metadata + run timestamp so
+# that intraday_assign.py can do nearest-centroid assignment
+# without re-running the full pipeline.
+# ─────────────────────────────────────────────────────────────
+_state_dir = os.path.dirname(__file__)
+
+# ── 1. Compute centroids for ALL final clusters (cream + provisional) ──
+_all_cids   = sorted(real_clusters_df["cluster_cream"].unique().tolist())
+_num_final  = len(_all_cids)
+_cid_to_pos = {cid: pos for pos, cid in enumerate(_all_cids)}
+
+_final_centroids = np.zeros((_num_final, embeddings.shape[1]), dtype=np.float32)
+for _cid in _all_cids:
+    _pos   = _cid_to_pos[_cid]
+    _idxs  = real_clusters_df[real_clusters_df["cluster_cream"] == _cid].index.tolist()
+    _vecs  = embeddings[_idxs]
+    _c     = _vecs.mean(axis=0)
+    _norm  = np.linalg.norm(_c)
+    _final_centroids[_pos] = _c / _norm if _norm > 0 else _c
+
+# ── 2. Save centroids.npy ─────────────────────────────────────
+_centroids_path = os.path.join(_state_dir, "centroids.npy")
+np.save(_centroids_path, _final_centroids)
+
+# ── 3. Save centroid_meta.json ────────────────────────────────
+_meta_path = os.path.join(_state_dir, "centroid_meta.json")
+_centroid_meta = {
+    "cluster_ids"    : _all_cids,            # list of cluster IDs in centroid row order
+    "next_cluster_id": max(_all_cids) + 1,   # intraday new clusters start here
+    "num_clusters"   : _num_final,
+    "cluster_info"   : {
+        str(cid): {
+            "size"      : int(_cluster_size.get(cid, 0)),
+            "confidence": str(real_clusters_df[real_clusters_df["cluster_cream"] == cid]["confidence"].mode()[0]),
+        }
+        for cid in _all_cids
+    },
+}
+with open(_meta_path, "w") as _mf:
+    json.dump(_centroid_meta, _mf)
+
+# ── 4. Save last_daily_run.txt ────────────────────────────────
+_ts_path = os.path.join(_state_dir, "last_daily_run.txt")
+with open(_ts_path, "w") as _tf:
+    _tf.write(datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+
+print(f"\n📌 Intraday state saved:")
+print(f"   centroids.npy       : {_num_final} clusters  ({_final_centroids.shape})")
+print(f"   centroid_meta.json  : cluster IDs + sizes + confidence")
+print(f"   last_daily_run.txt  : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
 # ── EMBEDDING COST SUMMARY ────────────────────────────────────
 _EMB_PRICE_PER_1M = 0.02   # text-embedding-3-small: $0.02 / 1M tokens
